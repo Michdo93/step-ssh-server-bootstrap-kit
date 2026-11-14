@@ -10,6 +10,9 @@ Supported: **Debian, Ubuntu, Raspberry Pi OS and DietPi**. Part of the set
 **step-ssh-server-bootstrap-kit** (servers) ·
 [step-ssh-client-bootstrap-kit](https://github.com/Michdo93/step-ssh-client-bootstrap-kit) (clients).
 
+To roll it out to many hosts over SSH use
+[ssh-step-ssh-server-bootstrap-manager](https://github.com/Michdo93/ssh-step-ssh-server-bootstrap-manager).
+
 ## Quick start
 
 As root or with `sudo`:
@@ -26,26 +29,38 @@ curl -fsSL https://raw.githubusercontent.com/Michdo93/step-ssh-server-bootstrap-
   --ca-url https://192.168.0.150 --fingerprint <sha256> --map root=sysadmin --map openhabvm=sysadmin
 ```
 
+With local accounts (created if missing, certificate login only, `sysadmin` also in group `sudo`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Michdo93/step-ssh-server-bootstrap-kit/main/install.sh | sudo bash -s -- \
+  --ca-url https://192.168.0.150 --fingerprint <sha256> --ensure-user ansible --sudo-user sysadmin --map root=sysadmin
+```
+
 Get the fingerprint on the CA: `step certificate fingerprint $(step path)/certs/root_ca.crt`
 (or `step-ca-ssh.sh info`).
 
 ## What it does
 
 1. **Privileges / OS:** root check, Debian/Ubuntu/Raspberry Pi OS/DietPi detection.
-2. **Packages:** `openssh-server` and `curl` if missing; the **step CLI** via
+2. **Packages:** `openssh-server` and `curl` if missing (DietPi with **Dropbear**: Dropbear cannot use
+   certificates – the kit stops, or replaces it by OpenSSH via `dietpi-software install 105` with
+   `--switch-dropbear`); the **step CLI** via
    [step-cli-bootstrap](https://github.com/Michdo93/step-cli-bootstrap) if missing.
 3. **CA trust:** `step ca bootstrap` into `/etc/step-ssh-server/step` – the root certificate is only accepted
    if its **SHA-256 fingerprint matches**. Then `GET /ssh/roots` over TLS verified with that root →
    `/etc/ssh/step_ca_user_keys.pub` (backup if it changed).
-4. **Principals:** `/usr/local/sbin/step-ssh-principals` (`AuthorizedPrincipalsCommand`) accepts for an
+4. **Accounts (optional):** `--ensure-user` creates missing accounts with home and bash and **no usable
+   password** (`*`, not locked – sshd would reject even certificates for a locked account with
+   `UsePAM no`); `--sudo-user` also adds them to group `sudo`.
+5. **Principals:** `/usr/local/sbin/step-ssh-principals` (`AuthorizedPrincipalsCommand`) accepts for an
    account always **its own name** (OpenSSH default) **plus** the lines of `/etc/ssh/auth_principals/<account>`.
    New accounts therefore work without extra files, mappings can be changed without restarting sshd.
-5. **sshd:**
+6. **sshd:**
    - with `Include /etc/ssh/sshd_config.d/*.conf` (Debian 12+, Ubuntu 22.04+): `05-step-ca.conf`
    - without (older images): a managed block in `sshd_config` **before the first `Match`** section
    - `sshd -t` must pass, and `sshd -T` must show **our** `TrustedUserCAKeys` (the first value wins in sshd –
      another file setting it earlier is detected) – otherwise the old configuration is restored.
-6. **Restart:** `systemctl restart ssh` (or `sshd`, init script, SIGHUP). Existing sessions stay open.
+7. **Restart:** `systemctl restart ssh` (or `sshd`, init script, SIGHUP). Existing sessions stay open.
 
 Re-running is safe (idempotent) and refreshes the CA keys, e.g. after a CA key rotation.
 
@@ -56,6 +71,9 @@ Re-running is safe (idempotent) and refreshes the CA keys, e.g. after a CA key r
 | `--ca-url URL` | step-ca URL, e.g. `https://192.168.0.150` (host must be in the CA's `dnsNames`) |
 | `--fingerprint FP` | SHA-256 fingerprint of the root certificate |
 | `--map USER=P1[,P2]` | account `USER` also accepts principals `P1`, `P2` (repeatable) |
+| `--ensure-user NAME[,NAME]` | create missing local accounts (certificate login only) |
+| `--sudo-user NAME[,NAME]` | like `--ensure-user` and add to group `sudo` |
+| `--switch-dropbear` | DietPi: replace Dropbear by OpenSSH (new host key!) |
 | `--no-restart` | write and test only |
 | `--yes` | no questions |
 | `--no-color` | plain output |

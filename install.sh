@@ -13,6 +13,10 @@
 #   --fingerprint FP      SHA-256 fingerprint of the CA root certificate
 #   --map USER=P1[,P2]    local account USER also accepts certificates with principal P1, P2
 #                         (repeatable), e.g. --map root=sysadmin --map openhab=sysadmin
+#   --ensure-user NAME    create the local account NAME if it is missing (home, bash, no usable
+#                         password - certificate login only), repeatable or comma separated
+#   --sudo-user NAME      like --ensure-user and add NAME to the sudo group
+#   --switch-dropbear     DietPi with Dropbear: replace Dropbear by OpenSSH (dietpi-software)
 #   --no-restart          only write and test the configuration, do not restart sshd
 #   --yes                 no questions
 #   --no-color            plain output
@@ -41,7 +45,10 @@ main() {
     FINGERPRINT="${STEP_FINGERPRINT:-}"
     ASSUME_YES="${ASSUME_DEFAULTS:-0}"
     RESTART=1
+    SWITCH_DROPBEAR=0
     MAPS=()
+    ENSURE_USERS=()
+    SUDO_USERS=()
     while [ $# -gt 0 ]; do
         case "$1" in
             --ca-url) CA_URL="${2:?}"; shift 2 ;;
@@ -50,10 +57,13 @@ main() {
             --fingerprint=*) FINGERPRINT="${1#*=}"; shift ;;
             --map) MAPS+=("${2:?}"); shift 2 ;;
             --map=*) MAPS+=("${1#*=}"); shift ;;
+            --ensure-user) IFS=',' read -r -a _u <<<"${2:?}"; ENSURE_USERS+=("${_u[@]}"); shift 2 ;;
+            --sudo-user) IFS=',' read -r -a _u <<<"${2:?}"; ENSURE_USERS+=("${_u[@]}"); SUDO_USERS+=("${_u[@]}"); shift 2 ;;
+            --switch-dropbear) SWITCH_DROPBEAR=1; shift ;;
             --no-restart) RESTART=0; shift ;;
             --yes|-y) ASSUME_YES=1; shift ;;
             --no-color) setup_colors 1; shift ;;
-            -h|--help) sed -n '2,24p' "${BASH_SOURCE[0]}" 2>/dev/null | sed 's/^# \{0,1\}//'; exit 0 ;;
+            -h|--help) sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" 2>/dev/null | sed -e '$d' -e 's/^# \{0,1\}//'; exit 0 ;;
             *) error "Unknown option: $1 (see --help)" ;;
         esac
     done
@@ -68,6 +78,7 @@ main() {
     ensure_step
     fetch_ca_keys
     install_principals_command
+    ensure_users
     apply_maps
     configure_sshd
     restart_sshd
@@ -146,7 +157,30 @@ ask_parameters() {
     printf '%s' "$FINGERPRINT" | grep -Eq '^[0-9a-f]{64}$' || error "The fingerprint must be 64 hex characters (SHA-256)."
 }
 
+# Dropbear (DietPi default) cannot use SSH certificates - OpenSSH is required.
+check_dropbear() {
+    [ -x /usr/sbin/sshd ] && return 0
+    command -v dropbear >/dev/null 2>&1 || pgrep -x dropbear >/dev/null 2>&1 || return 0
+    if [ -x /boot/dietpi/dietpi-software ]; then
+        if [ "$SWITCH_DROPBEAR" != 1 ] && [ "$interactive" = 1 ]; then
+            case "$(ask "Dropbear cannot use SSH certificates. Replace it by OpenSSH now (dietpi-software)? (yes/no) [no]: " no)" in
+                y|Y|yes|Yes|j|ja) SWITCH_DROPBEAR=1 ;;
+            esac
+        fi
+        [ "$SWITCH_DROPBEAR" = 1 ] ||
+            error "This DietPi uses Dropbear, which cannot use SSH certificates. Re-run with --switch-dropbear or run: dietpi-software install 105 (OpenSSH Server)."
+        step_msg "Replacing Dropbear by OpenSSH (dietpi-software install 105)"
+        warn "Your current SSH session runs over Dropbear - if it drops, reconnect and re-run this script."
+        /boot/dietpi/dietpi-software install 105 </dev/null || error "dietpi-software install 105 failed."
+        [ -x /usr/sbin/sshd ] || error "OpenSSH is still not installed."
+        info "OpenSSH server installed by dietpi-software."
+    else
+        error "Dropbear is used as SSH server; it cannot use SSH certificates. Install openssh-server and remove dropbear first."
+    fi
+}
+
 ensure_packages() {
+    check_dropbear
     local missing=()
     [ -x /usr/sbin/sshd ] || missing+=(openssh-server)
     command -v curl >/dev/null 2>&1 || missing+=(curl ca-certificates)
@@ -244,6 +278,31 @@ EOF
 }
 
 valid_name() { [[ "$1" =~ ^[a-z_][a-z0-9_.-]{0,31}\$?$ ]]; }
+
+ensure_users() {
+    [ ${#ENSURE_USERS[@]} -gt 0 ] || return 0
+    step_msg "Local accounts"
+    local u s
+    mapfile -t ENSURE_USERS < <(printf '%s\n' "${ENSURE_USERS[@]}" | awk 'NF && !seen[$0]++')
+    for u in "${ENSURE_USERS[@]}"; do
+        valid_name "$u" || error "Invalid user name '$u'."
+        if id "$u" >/dev/null 2>&1; then
+            info "  $u exists"
+        else
+            useradd -m -s /bin/bash "$u" || error "useradd $u failed."
+            # "*" = no password login possible, but NOT locked ("!"): sshd with UsePAM=no
+            # rejects even key/certificate logins for locked accounts.
+            usermod -p '*' "$u"
+            info "  $u created (no password - certificate login only)"
+        fi
+        for s in "${SUDO_USERS[@]}"; do
+            [ "$s" = "$u" ] || continue
+            getent group sudo >/dev/null 2>&1 || { warn "  group sudo does not exist - $u not added"; continue; }
+            if id -nG "$u" | tr ' ' '\n' | grep -qx sudo; then info "  $u already in group sudo"
+            else usermod -aG sudo "$u"; info "  $u added to group sudo (sudo still asks for a password - set one with: passwd $u)"; fi
+        done
+    done
+}
 
 apply_maps() {
     [ ${#MAPS[@]} -gt 0 ] || return 0
